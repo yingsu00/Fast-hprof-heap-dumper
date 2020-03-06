@@ -1,0 +1,1 @@
+make JDK=/usr/local/fbprojects/packages/fb-jdk-8/10 OSNAME=linux OPT=false

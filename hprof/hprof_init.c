@@ -40,6 +40,8 @@
 
 /* Main source file, the basic JVMTI connection/startup code. */
 
+#include <time.h>
+#include <unistd.h>
 #include "hprof.h"
 
 #include "java_crw_demo.h"
@@ -63,6 +65,7 @@
 /* The default output filenames. */
 
 #define DEFAULT_TXT_SUFFIX      ".txt"
+#define DEFAULT_ZSTD_SUFFIX      ".zst"
 #define DEFAULT_OUTPUTFILE      "java.hprof"
 #define DEFAULT_OUTPUTTEMP      "java.hprof.temp"
 
@@ -162,7 +165,7 @@ get_gdata(void)
     data.prof_trace_depth               = DEFAULT_TRACE_DEPTH;
     data.sample_interval                = DEFAULT_SAMPLE_INTERVAL;
     data.lineno_in_traces               = JNI_TRUE;
-    data.output_format                  = 'a';      /* 'b' for binary */
+    data.output_format                  = 'a';      /* 'b' for binary , 'z' for zstd compressed binary */
     data.cutoff_point                   = DEFAULT_CUTOFF_POINT;
     data.dump_on_exit                   = JNI_TRUE;
     data.gc_start_time                  = -1L;
@@ -283,7 +286,8 @@ make_unique_filename(char **filename)
         suffix[0] = 0;
 
         /* Look for .txt suffix if not binary output */
-        if (gdata->output_format != 'b') {
+        //if (gdata->output_format != 'b') {
+        if (gdata->output_format == 'a') {
             char *dot;
             char *format_suffix;
 
@@ -500,6 +504,7 @@ static void
 parse_options(char *command_line_options)
 {
     int file_or_net_option_seen = JNI_FALSE;
+    int compression_level_option_seen = JNI_FALSE;
     char *all_options;
     char *extra_options;
     char *options;
@@ -568,14 +573,36 @@ parse_options(char *command_line_options)
             file_or_net_option_seen = JNI_TRUE;
         } else if (strcmp(option, "format") == 0) {
             if (!get_tok(&options, suboption, (int)sizeof(suboption), ',')) {
-                option_error("syntax error parsing format=a|b");
+                option_error("syntax error parsing format=a|b|z");
             }
             if (strcmp(suboption, "a") == 0) {
                 gdata->output_format = 'a';
             } else if (strcmp(suboption, "b") == 0) {
                 gdata->output_format = 'b';
-            } else {
-                option_error("format option value must be a|b");
+            } else if (strcmp(suboption, "z") == 0) {  // yingsu: zstd
+                gdata->output_format = 'z';
+            }
+            else {
+                option_error("format option value must be a|b|z");
+            }
+        } else if (strcmp(option, "compress_level") == 0) {
+            if (!get_tok(&options, suboption, (int)sizeof(suboption), ',')) {
+                option_error("syntax error parsing compress_level=numeric");
+            }
+            gdata->compress_level = (int)strtol(suboption, &endptr, 10);
+            if ((endptr != NULL && *endptr != 0) || gdata->compress_level < 0 || gdata->compress_level > ZSTD_maxCLevel()) {
+                char error_msg[64];
+                sprintf(error_msg, "compress_level option value must be integer, >= 0 and <= %d", ZSTD_maxCLevel());
+                option_error(error_msg);
+            }
+            compression_level_option_seen = JNI_TRUE;
+        } else if (strcmp(option, "truncate_elems") == 0) {
+            if (!get_tok(&options, suboption, (int)sizeof(suboption), ',')) {
+                option_error("syntax error parsing truncate_elems=numeric");
+            }
+            gdata->truncate_elems = (int)strtol(suboption, &endptr, 10);
+            if ((endptr != NULL && *endptr != 0) || gdata->truncate_elems < 0 ) {
+                option_error("truncate_elems option value must be integer >= 0");
             }
         } else if (strcmp(option, "depth") == 0) {
             if (!get_tok(&options, suboption, (int)sizeof(suboption), ',')) {
@@ -715,13 +742,17 @@ parse_options(char *command_line_options)
         }
     }
 
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format == 'b' || gdata->output_format == 'z') {
         if (gdata->cpu_timing) {
-            option_error("cpu=times|old is not supported with format=b");
+            option_error("cpu=times|old is not supported with format=b or z");
         }
         if (gdata->monitor_tracing) {
-            option_error("monitor=y is not supported with format=b");
+            option_error("monitor=y is not supported with format=b or z");
         }
+    }
+
+    if (compression_level_option_seen && gdata->output_format !='z') {
+          option_error("compression_level=NUMERIC option is not supported with format=a or b");
     }
 
     if (gdata->old_timing_format) {
@@ -730,6 +761,8 @@ parse_options(char *command_line_options)
 
     if (gdata->output_format == 'b') {
         default_filename = DEFAULT_OUTPUTFILE;
+    } else if (gdata->output_format == 'z') {
+        default_filename = DEFAULT_OUTPUTFILE DEFAULT_ZSTD_SUFFIX;
     } else {
         default_filename = DEFAULT_OUTPUTFILE DEFAULT_TXT_SUFFIX;
     }
@@ -766,7 +799,8 @@ parse_options(char *command_line_options)
         gdata->obj_watch = JNI_TRUE;
     }
     if ( gdata->obj_watch || gdata->cpu_timing ) {
-        gdata->bci = JNI_TRUE;
+        //gdata->bci = JNI_TRUE;
+        gdata->bci = JNI_FALSE;
     }
 
     /* Create files & sockets needed */
@@ -784,8 +818,9 @@ parse_options(char *command_line_options)
         (void)strcpy(gdata->heapfilename, base);
         (void)strcat(gdata->heapfilename, ".TMP");
         make_unique_filename(&(gdata->heapfilename));
+        printf("yingsu gdata->heapfilename %s\n", gdata->heapfilename);
         (void)remove(gdata->heapfilename);
-        if (gdata->output_format == 'b') {
+        if (gdata->output_format != 'a') {
             if ( gdata->logflags & LOG_CHECK_BINARY ) {
                 char * check_suffix;
 
@@ -833,10 +868,11 @@ parse_options(char *command_line_options)
         if ( !gdata->force_output ) {
             make_unique_filename(&(gdata->output_filename));
         }
+        printf("yingsu gdata->output_filename 2 %s\n", gdata->output_filename);
         /* Make doubly sure this file does NOT exist */
         (void)remove(gdata->output_filename);
         /* Create the file */
-        if (gdata->output_format == 'b') {
+        if (gdata->output_format == 'b' || gdata->output_format == 'z') {
             gdata->fd = md_creat_binary(gdata->output_filename);
         } else {
             gdata->fd = md_creat(gdata->output_filename);
@@ -910,9 +946,12 @@ dump_all_data(JNIEnv *env)
             trace_output_cost_in_prof_format(env);
         }
     }
+    verbose_message("reset_all_data starts on thread %lu\n", (unsigned long) pthread_self());
     reset_all_data();
+    verbose_message("reset_all_data ends on thread %lu\n", (unsigned long) pthread_self());
     io_flush();
     verbose_message(" done.\n");
+
 }
 
 /* ------------------------------------------------------------------- */
@@ -1142,6 +1181,10 @@ setup_event_mode(jboolean onload_set_only, jvmtiEventMode state)
 static void JNICALL
 cbVMInit(jvmtiEnv *jvmti, JNIEnv *env, jthread thread)
 {
+    print_timestamp("cbVMInit", 1);
+
+    verbose_message(gdata->errmsg);
+
     rawMonitorEnter(gdata->data_access_lock); {
 
         LoaderIndex loader_index;
@@ -1153,7 +1196,8 @@ cbVMInit(jvmtiEnv *jvmti, JNIEnv *env, jthread thread)
         /* Header to use in heap dumps */
         gdata->header    = "JAVA PROFILE 1.0.1";
         gdata->segmented = JNI_FALSE;
-        if (gdata->output_format == 'b') {
+
+        if (gdata->output_format != 'a') {
             /* We need JNI here to call in and get the current maximum memory */
             gdata->maxMemory      = getMaxMemory(env);
             gdata->maxHeapSegment = (jlong)2000000000;
@@ -1250,18 +1294,24 @@ cbVMInit(jvmtiEnv *jvmti, JNIEnv *env, jthread thread)
         LOG("cbVMInit end");
 
     } rawMonitorExit(gdata->data_access_lock);
+
+    print_timestamp("cbVMInit", 0);
 }
 
 /* JVMTI_EVENT_VM_DEATH */
 static void JNICALL
 cbVMDeath(jvmtiEnv *jvmti, JNIEnv *env)
 {
+    print_timestamp("cbVMDeath", 1);
+
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
     /*
      * Use local flag to minimize gdata->dump_lock hold time.
      */
     jboolean need_to_dump = JNI_FALSE;
 
-    LOG("cbVMDeath");
+    //LOG("cbVMDeath");
 
     /* Shutdown thread watching gc_finish, outside CALLBACK locks.
      *   We need to make sure the watcher thread is done doing any cleanup
@@ -1423,28 +1473,40 @@ cbVMDeath(jvmtiEnv *jvmti, JNIEnv *env)
     loader_delete_global_references(env);
     tls_delete_global_references(env);
 
+    gettimeofday(&end, NULL);
+    verbose_message("cbVMDeath took %ld seconds\n", end.tv_sec - start.tv_sec);
+
+    print_timestamp("cbVMDeath", 0);
 }
 
 /* JVMTI_EVENT_THREAD_START */
 static void JNICALL
 cbThreadStart(jvmtiEnv *jvmti, JNIEnv *env, jthread thread)
 {
+    print_timestamp("cbThreadStart", 1);
+
     LOG3("cbThreadStart", "thread is", (int)(long)(ptrdiff_t)thread);
 
     BEGIN_CALLBACK() {
         event_thread_start(env, thread);
     } END_CALLBACK();
+
+    print_timestamp("cbThreadStart", 0);
 }
 
 /* JVMTI_EVENT_THREAD_END */
 static void JNICALL
 cbThreadEnd(jvmtiEnv *jvmti, JNIEnv *env, jthread thread)
 {
+    print_timestamp("cbThreadEnd", 1);
+
     LOG3("cbThreadEnd", "thread is", (int)(long)(ptrdiff_t)thread);
 
     BEGIN_CALLBACK() {
         event_thread_end(env, thread);
     } END_CALLBACK();
+
+    print_timestamp("cbThreadEnd", 0);
 }
 
 /* JVMTI_EVENT_CLASS_FILE_LOAD_HOOK */
@@ -1455,6 +1517,7 @@ cbClassFileLoadHook(jvmtiEnv *jvmti_env, JNIEnv* env,
                 jint class_data_len, const unsigned char* class_data,
                 jint* new_class_data_len, unsigned char** new_class_data)
 {
+    print_timestamp("cbClassFileLoadHook", 1);
 
     /* WARNING: This will be called before VM_INIT. */
 
@@ -1579,12 +1642,16 @@ cbClassFileLoadHook(jvmtiEnv *jvmti_env, JNIEnv* env,
             (void)free((void*)classname);
         } rawMonitorExit(gdata->data_access_lock);
     } END_CALLBACK();
+
+    print_timestamp("cbClassFileLoadHook", 0);
 }
 
 /* JVMTI_EVENT_CLASS_LOAD */
 static void JNICALL
 cbClassLoad(jvmtiEnv *jvmti, JNIEnv *env, jthread thread, jclass klass)
 {
+
+    print_timestamp("cbClassLoad", 1);
 
     /* WARNING: This MAY be called before VM_INIT. */
 
@@ -1602,12 +1669,16 @@ cbClassLoad(jvmtiEnv *jvmti, JNIEnv *env, jthread thread, jclass klass)
 
         } rawMonitorExit(gdata->data_access_lock);
     } END_CALLBACK();
+
+    print_timestamp("cbClassLoad", 0);
+
 }
 
 /* JVMTI_EVENT_CLASS_PREPARE */
 static void JNICALL
 cbClassPrepare(jvmtiEnv *jvmti, JNIEnv *env, jthread thread, jclass klass)
 {
+    print_timestamp("cbClassPrepare", 1);
 
     /* WARNING: This will be called before VM_INIT. */
 
@@ -1627,12 +1698,19 @@ cbClassPrepare(jvmtiEnv *jvmti, JNIEnv *env, jthread thread, jclass klass)
         } rawMonitorExit(gdata->data_access_lock);
     } END_CALLBACK();
 
+    print_timestamp("cbClassPrepare", 0);
+
 }
 
 /* JVMTI_EVENT_DATA_DUMP_REQUEST */
 static void JNICALL
 cbDataDumpRequest(jvmtiEnv *jvmti)
 {
+    print_timestamp("cbDataDumpRequest", 1);
+
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
+
     jboolean need_to_dump;
 
     LOG("cbDataDumpRequest");
@@ -1659,6 +1737,9 @@ cbDataDumpRequest(jvmtiEnv *jvmti)
         }
     } END_CALLBACK();
 
+    gettimeofday(&end, NULL);
+    verbose_message("cbDataDumpRequest took %ld seconds\n", end.tv_sec - start.tv_sec);
+    print_timestamp("cbDataDumpRequest", 0);
 }
 
 /* JVMTI_EVENT_EXCEPTION_CATCH */
@@ -1667,11 +1748,15 @@ cbExceptionCatch(jvmtiEnv *jvmti, JNIEnv* env,
                 jthread thread, jmethodID method, jlocation location,
                 jobject exception)
 {
+    print_timestamp("cbExceptionCatch", 1);
+
     LOG("cbExceptionCatch");
 
     BEGIN_CALLBACK() {
         event_exception_catch(env, thread, method, location, exception);
     } END_CALLBACK();
+
+    print_timestamp("cbExceptionCatch", 0);
 }
 
 /* JVMTI_EVENT_MONITOR_WAIT */
@@ -1679,11 +1764,15 @@ static void JNICALL
 cbMonitorWait(jvmtiEnv *jvmti, JNIEnv* env,
                 jthread thread, jobject object, jlong timeout)
 {
+    print_timestamp("cbMonitorWait", 1);
+
     LOG("cbMonitorWait");
 
     BEGIN_CALLBACK() {
         monitor_wait_event(env, thread, object, timeout);
     } END_CALLBACK();
+
+    print_timestamp("cbMonitorWait", 0);
 }
 
 /* JVMTI_EVENT_MONITOR_WAITED */
@@ -1691,11 +1780,15 @@ static void JNICALL
 cbMonitorWaited(jvmtiEnv *jvmti, JNIEnv* env,
                 jthread thread, jobject object, jboolean timed_out)
 {
+    print_timestamp("cbMonitorWaited", 1);
+
     LOG("cbMonitorWaited");
 
     BEGIN_CALLBACK() {
         monitor_waited_event(env, thread, object, timed_out);
     } END_CALLBACK();
+
+    print_timestamp("cbMonitorWaited", 0);
 }
 
 /* JVMTI_EVENT_MONITOR_CONTENDED_ENTER */
@@ -1703,11 +1796,13 @@ static void JNICALL
 cbMonitorContendedEnter(jvmtiEnv *jvmti, JNIEnv* env,
                 jthread thread, jobject object)
 {
-    LOG("cbMonitorContendedEnter");
+    print_timestamp("cbMonitorContendedEnter", 1);
 
     BEGIN_CALLBACK() {
         monitor_contended_enter_event(env, thread, object);
     } END_CALLBACK();
+
+    print_timestamp("cbMonitorContendedEnter", 0);
 }
 
 /* JVMTI_EVENT_MONITOR_CONTENDED_ENTERED */
@@ -1715,31 +1810,36 @@ static void JNICALL
 cbMonitorContendedEntered(jvmtiEnv *jvmti, JNIEnv* env,
                 jthread thread, jobject object)
 {
-    LOG("cbMonitorContendedEntered");
+    print_timestamp("cbMonitorContendedEntered", 1);
 
     BEGIN_CALLBACK() {
         monitor_contended_entered_event(env, thread, object);
     } END_CALLBACK();
+
+    print_timestamp("cbMonitorContendedEntered", 0);
 }
 
 /* JVMTI_EVENT_GARBAGE_COLLECTION_START */
 static void JNICALL
 cbGarbageCollectionStart(jvmtiEnv *jvmti)
 {
-    LOG("cbGarbageCollectionStart");
+    print_timestamp("cbGarbageCollectionStart", 1);
 
     /* Only calls to Allocate, Deallocate, RawMonitorEnter & RawMonitorExit
      *   are allowed here (see the JVMTI Spec).
      */
+    // cbDataDumpRequest(jvmti);
 
     gdata->gc_start_time = md_get_timemillis();
+
+    print_timestamp("cbGarbageCollectionStart", 0);
 }
 
 /* JVMTI_EVENT_GARBAGE_COLLECTION_FINISH */
 static void JNICALL
 cbGarbageCollectionFinish(jvmtiEnv *jvmti)
 {
-    LOG("cbGarbageCollectionFinish");
+    print_timestamp("cbGarbageCollectionFinish", 1);
 
     /* Only calls to Allocate, Deallocate, RawMonitorEnter & RawMonitorExit
      *   are allowed here (see the JVMTI Spec).
@@ -1760,12 +1860,16 @@ cbGarbageCollectionFinish(jvmtiEnv *jvmti)
             rawMonitorNotifyAll(gdata->gc_finish_lock);
         }
     } rawMonitorExit(gdata->gc_finish_lock);
+
+    print_timestamp("cbGarbageCollectionFinish", 0);
 }
 
 /* JVMTI_EVENT_OBJECT_FREE */
 static void JNICALL
 cbObjectFree(jvmtiEnv *jvmti, jlong tag)
 {
+    print_timestamp("cbObjectFree", 1);
+
     LOG3("cbObjectFree", "tag", (int)tag);
 
     /* Only calls to Allocate, Deallocate, RawMonitorEnter & RawMonitorExit
@@ -1785,6 +1889,8 @@ cbObjectFree(jvmtiEnv *jvmti, jlong tag)
             stack_push(stack, (void*)&tag);
         }
     } rawMonitorExit(gdata->object_free_lock);
+
+    print_timestamp("cbObjectFree", 0);
 }
 
 static void
@@ -1899,8 +2005,12 @@ load_library(char *name)
      */
     getSystemProperty("sun.boot.library.path", &boot_path);
     md_build_library_name(lname, FILENAME_MAX, boot_path, name);
+    char errmsg[256];
+    (void)md_snprintf(errmsg, sizeof(errmsg),
+                "Could not find library %s, boot_path %s, lname %s\n", name, boot_path, lname);
+    memcpy(gdata->errmsg, errmsg, sizeof(errmsg));
     if ( strlen(lname) == 0 ) {
-        HPROF_ERROR(JNI_TRUE, "Could not find library");
+        HPROF_ERROR(JNI_TRUE, errmsg);
     }
     jvmtiDeallocate(boot_path);
     handle = md_load_library(lname, err_buf, (int)sizeof(err_buf));
@@ -1974,6 +2084,7 @@ Agent_OnLoad(JavaVM *vm, char *options, void *reserved)
     getSystemProperty("sun.boot.library.path", &boot_path);
     /* Load in NPT library for character conversions */
     md_build_library_name(npt_lib, sizeof(npt_lib), boot_path, NPT_LIBNAME);
+    memcpy(gdata->npt_lib, npt_lib, JVM_MAXPATHLEN);
     if ( strlen(npt_lib) == 0 ) {
         HPROF_ERROR(JNI_TRUE, "Could not find npt library");
     }
@@ -2030,6 +2141,7 @@ Agent_OnLoad(JavaVM *vm, char *options, void *reserved)
     gdata->callbackBlock      = createRawMonitor("HPROF callback block");
     gdata->object_free_lock   = createRawMonitor("HPROF object free lock");
     gdata->gc_finish_lock     = createRawMonitor("HPROF gc_finish lock");
+    gdata->heap_raw_threadid_lock = createRawMonitor("HPROF heap_raw_threadid_lock");
 
     /* Set Onload events mode. */
     setup_event_mode(JNI_TRUE, JVMTI_ENABLE);
@@ -2150,6 +2262,9 @@ Agent_OnUnload(JavaVM *vm)
         destroyRawMonitor(gdata->debug_malloc_lock);
         gdata->debug_malloc_lock = NULL;
     #endif
+
+    destroyRawMonitor(gdata->heap_raw_threadid_lock);
+    gdata->heap_raw_threadid_lock = NULL;
 
     /* Unload java_crw_demo library */
     if ( gdata->bci && gdata->java_crw_demo_library != NULL ) {

@@ -485,6 +485,7 @@ cbPrimArrayData(jlong class_tag, jlong size, jlong* tag_ptr,
          jint element_count, jvmtiPrimitiveType element_type,
          const void* elements, void* user_data)
 {
+    print_timestamp("cbPrimArrayData", 1);
     ObjectIndex   object_index;
     RefIndex      ref_index;
     RefIndex      prev_ref_index;
@@ -506,6 +507,7 @@ cbPrimArrayData(jlong class_tag, jlong size, jlong* tag_ptr,
                   element_type, elements, element_count);
     object_set_references(object_index, ref_index);
 
+    print_timestamp("cbPrimArrayData", 0);
     return JVMTI_VISIT_OBJECTS;
 }
 
@@ -516,14 +518,16 @@ cbPrimFieldData(jvmtiHeapReferenceKind reference_kind,
          jlong* tag_ptr, jvalue value, jvmtiPrimitiveType value_type,
          void* user_data)
 {
+    print_timestamp("cbPrimFieldData", 1);
+
     ObjectIndex   object_index;
     jint          field_index;
     RefIndex      ref_index;
     RefIndex      prev_ref_index;
 
     HPROF_ASSERT(tag_ptr!=NULL);
-    HPROF_ASSERT(class_tag!=(jlong)0);
-    HPROF_ASSERT((*tag_ptr)!=(jlong)0);
+    //HPROF_ASSERT(class_tag!=(jlong)0);
+    //HPROF_ASSERT((*tag_ptr)!=(jlong)0);
     if ( class_tag == (jlong)0 || (*tag_ptr) == (jlong)0 ) {
         /* We can't do anything with a class_tag==0, just skip it */
         return JVMTI_VISIT_OBJECTS;
@@ -546,6 +550,7 @@ cbPrimFieldData(jvmtiHeapReferenceKind reference_kind,
                   value_type, value, field_index);
     object_set_references(object_index, ref_index);
 
+    print_timestamp("cbPrimFieldData", 0);
     return JVMTI_VISIT_OBJECTS;
 }
 
@@ -620,7 +625,7 @@ objectReference(jvmtiHeapReferenceKind reference_kind,
     HPROF_ASSERT(tag_ptr!=NULL);
     HPROF_ASSERT(class_tag!=(jlong)0);
     HPROF_ASSERT(referrer_tag_ptr!=NULL);
-    HPROF_ASSERT((*referrer_tag_ptr)!=(jlong)0);
+    //HPROF_ASSERT((*referrer_tag_ptr)!=(jlong)0);
     if ( class_tag == (jlong)0 || (*referrer_tag_ptr) == (jlong)0 ) {
         /* We can't do anything with a class_tag==0, just skip it */
         return JVMTI_VISIT_OBJECTS;
@@ -681,14 +686,15 @@ cbReference(jvmtiHeapReferenceKind reference_kind,
                   jlong size, jlong* tag_ptr,
                   jlong* referrer_tag_ptr, jint length, void* user_data)
 {
+   print_timestamp("cbReference", 1);
     ObjectIndex   object_index;
 
    /* Only calls to Allocate, Deallocate, RawMonitorEnter & RawMonitorExit
     *   are allowed here (see the JVMTI Spec).
     */
-
+    //
     HPROF_ASSERT(tag_ptr!=NULL);
-    HPROF_ASSERT(class_tag!=(jlong)0);
+    //HPROF_ASSERT(class_tag!=(jlong)0);
     if ( class_tag == (jlong)0 ) {
         /* We can't do anything with a class_tag==0, just skip it */
         return JVMTI_VISIT_OBJECTS;
@@ -704,6 +710,7 @@ cbReference(jvmtiHeapReferenceKind reference_kind,
         case JVMTI_HEAP_REFERENCE_INTERFACE:
         case JVMTI_HEAP_REFERENCE_STATIC_FIELD:
         case JVMTI_HEAP_REFERENCE_CONSTANT_POOL:
+            print_timestamp("cbReference", 0);
             return objectReference(reference_kind, reference_info,
                    class_tag, size, tag_ptr, referrer_tag_ptr, length);
 
@@ -841,6 +848,7 @@ cbReference(jvmtiHeapReferenceKind reference_kind,
 
     }
 
+    print_timestamp("cbReference", 0);
     return JVMTI_VISIT_OBJECTS;
 }
 
@@ -849,6 +857,10 @@ site_heapdump(JNIEnv *env)
 {
 
     rawMonitorEnter(gdata->data_access_lock); {
+      setEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_THREAD_START, NULL);
+      setEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_THREAD_END, NULL);
+      setEventNotificationMode(JVMTI_DISABLE,JVMTI_EVENT_CLASS_LOAD, NULL);
+      setEventNotificationMode(JVMTI_DISABLE,JVMTI_EVENT_CLASS_PREPARE, NULL);
 
         jvmtiHeapCallbacks heapCallbacks;
 
@@ -888,18 +900,43 @@ site_heapdump(JNIEnv *env)
         if ( gdata->primarrays == JNI_TRUE ) {
             heapCallbacks.array_primitive_value_callback  = &cbPrimArrayData;
         }
+
+        verbose_message("followReferences starts on thread %lu\n", (unsigned long) pthread_self());
+        struct timeval start, end;
+        gettimeofday(&start, NULL);
+
         followReferences(&heapCallbacks, (void*)NULL);
 
+        gettimeofday(&end, NULL);
+        verbose_message("followReferences took %ld seconds on thread %lu\n", end.tv_sec - start.tv_sec, (unsigned long) pthread_self());
+
         /* Process reference information. */
+        gettimeofday(&start, NULL);
         object_reference_dump(env);
         object_clear_references();
         reference_cleanup();
 
+        gettimeofday(&end, NULL);
+        verbose_message("Process reference information took %ld seconds on thread %lu\n", end.tv_sec - start.tv_sec, (unsigned long) pthread_self());
+
+
         /* Dump the last thread traces and get the lists back we need */
+        gettimeofday(&start, NULL);
         tls_dump_traces(env);
+        gettimeofday(&end, NULL);
+        verbose_message("tls_dump_traces took %ld seconds on thread %lu\n", end.tv_sec - start.tv_sec, (unsigned long) pthread_self());
+
 
         /* Write out footer for heap dump */
         io_heap_footer();
 
+        verbose_message("site_heapdump ends on thread %lu\n", (unsigned long) pthread_self());
+
+        setEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_THREAD_START, NULL);
+        setEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_THREAD_END, NULL);
+        setEventNotificationMode(JVMTI_DISABLE,JVMTI_EVENT_CLASS_LOAD, NULL);
+        setEventNotificationMode(JVMTI_DISABLE,JVMTI_EVENT_CLASS_PREPARE, NULL);
+
     } rawMonitorExit(gdata->data_access_lock);
+
 }

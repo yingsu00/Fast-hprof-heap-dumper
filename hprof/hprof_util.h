@@ -74,7 +74,13 @@
         }                                                               \
         _exception = exceptionOccurred(_env);                           \
         if ( _exception != NULL ) {                                     \
-            exceptionDescribe(_env);                                    \
+            exceptionDescribe(_env);  \
+            jboolean isCopy = JNI_FALSE;  \
+            jmethodID toString = (*_env)->GetMethodID(_env, (*_env)->FindClass(_env, "java/lang/Object"), "toString", "()Ljava/lang/String;"); \
+            jstring s = (jstring)(*_env)->CallObjectMethod(_env, _exception, toString); \
+            const char* utf = (*_env)->GetStringUTFChars(_env, s, &isCopy);      \
+            HPROF_ERROR(JNI_FALSE, utf);  \
+            (*_env)->ReleaseStringUTFChars(_env, s, utf); \
             HPROF_ERROR(JNI_TRUE, "Unexpected Exception found afterward");\
         }                                                               \
     }

@@ -671,6 +671,8 @@ table_initialize(const char *name, int size, int incr, int bucket_count,
     ltable = (LookupTable *)HPROF_MALLOC((int)sizeof(LookupTable));
     (void)memset(ltable, 0, (int)sizeof(LookupTable));
 
+    //verbose_message("table_initialize %s %ld\n", name, ltable);
+
     (void)strncpy(ltable->name, name, sizeof(ltable->name));
 
     elem_size = (int)sizeof(TableElement);
@@ -715,9 +717,12 @@ table_element_count(LookupTable *ltable)
 
     HPROF_ASSERT(ltable!=NULL);
 
-    lock_enter(ltable->lock); {
+    //verbose_message("table_element_count %s %ld\n", ltable->name, ltable);
+
+   //lock_enter(ltable->lock); {
+        //verbose_message("lock_enter table_element_count ltable %s thread %lu\n", ltable->name, (unsigned long)pthread_self());
         nelems = ltable->next_index-1;
-    } lock_exit(ltable->lock);
+    //} lock_exit(ltable->lock);
 
     return nelems;
 }
@@ -730,10 +735,11 @@ table_free_entry(LookupTable *ltable, TableIndex index)
     index = SANITY_REMOVE_HARE(index);
     SANITY_CHECK_INDEX(ltable, index);
 
-    lock_enter(ltable->lock); {
+   //lock_enter(ltable->lock); {
+        //verbose_message("lock_enter table_free_entry ltable %s thread %lu\n", ltable->name, (unsigned long)pthread_self());
         HPROF_ASSERT(!is_freed_entry(ltable, index));
         free_entry(ltable, index);
-    } lock_exit(ltable->lock);
+    //} lock_exit(ltable->lock);
 }
 
 void
@@ -744,10 +750,11 @@ table_walk_items(LookupTable *ltable, LookupTableIterator func, void* arg)
     }
     HPROF_ASSERT(func!=NULL);
 
-    lock_enter(ltable->lock); {
+   //lock_enter(ltable->lock); {
         TableIndex index;
         int        fcount;
 
+        //verbose_message("lock_enter table_walk_items ltable %s thread %lu\n", ltable->name, (unsigned long)pthread_self());
         LOG3("table_walk_items() count+free", ltable->name, ltable->next_index);
         fcount = 0;
         for ( index = 1 ; index < ltable->next_index ; index++ ) {
@@ -771,8 +778,8 @@ table_walk_items(LookupTable *ltable, LookupTableIterator func, void* arg)
             }
         }
         LOG3("table_walk_items() count-free", ltable->name, ltable->next_index);
-        HPROF_ASSERT(fcount==ltable->freed_count);
-    } lock_exit(ltable->lock);
+    //    HPROF_ASSERT(fcount==ltable->freed_count);
+    //} lock_exit(ltable->lock);
 }
 
 void
@@ -786,7 +793,8 @@ table_cleanup(LookupTable *ltable, LookupTableIterator func, void *arg)
         table_walk_items(ltable, func, arg);
     }
 
-    lock_enter(ltable->lock); {
+   //lock_enter(ltable->lock); {
+        //verbose_message("lock_enter table_cleanup ltable %s thread %lu\n", ltable->name, (unsigned long)pthread_self());
 
         HPROF_FREE(ltable->table);
         if ( ltable->hash_buckets != NULL ) {
@@ -804,7 +812,7 @@ table_cleanup(LookupTable *ltable, LookupTableIterator func, void *arg)
             ltable->key_blocks = NULL;
         }
 
-    } lock_exit(ltable->lock);
+    //} lock_exit(ltable->lock);
 
     lock_destroy(ltable->lock);
     ltable->lock = NULL;
@@ -828,7 +836,9 @@ table_create_entry(LookupTable *ltable, void *key_ptr, int key_len, void *info_p
     }
 
     /* Create a new entry */
-    lock_enter(ltable->lock); {
+   //lock_enter(ltable->lock); {
+
+        //verbose_message("lock_enter table_create_entry ltable %s thread %lu\n", ltable->name, (unsigned long)pthread_self());
 
         /* Need to create a new entry */
         index = setup_new_entry(ltable, key_ptr, key_len, info_ptr);
@@ -838,7 +848,7 @@ table_create_entry(LookupTable *ltable, void *key_ptr, int key_len, void *info_p
             hash_in(ltable, index, hcode);
         }
 
-    } lock_exit(ltable->lock);
+    //} lock_exit(ltable->lock);
     return SANITY_ADD_HARE(index, ltable->hare);
 }
 
@@ -855,9 +865,10 @@ table_find_entry(LookupTable *ltable, void *key_ptr, int key_len)
     }
 
     /* Look for element */
-    lock_enter(ltable->lock); {
+   //lock_enter(ltable->lock); {
+        //verbose_message("lock_enter table_find_entry ltable %s thread %lu\n", ltable->name, (unsigned long)pthread_self());
         index = find_entry(ltable, key_ptr, key_len, hcode);
-    } lock_exit(ltable->lock);
+    //} lock_exit(ltable->lock);
 
     return index==0 ? index : SANITY_ADD_HARE(index, ltable->hare);
 }
@@ -882,7 +893,9 @@ table_find_or_create_entry(LookupTable *ltable, void *key_ptr, int key_len,
 
     /* Look for element */
     index = 0;
-    lock_enter(ltable->lock); {
+   //lock_enter(ltable->lock); {
+        //verbose_message("lock_enter table_find_or_create_entry ltable %s thread %lu\n", ltable->name, (unsigned long)pthread_self());
+
         if ( ltable->hash_bucket_count > 0 ) {
             index = find_entry(ltable, key_ptr, key_len, hcode);
         }
@@ -900,7 +913,7 @@ table_find_or_create_entry(LookupTable *ltable, void *key_ptr, int key_len,
                 *pnew_entry = JNI_TRUE;
             }
         }
-    } lock_exit(ltable->lock);
+    //} lock_exit(ltable->lock);
 
     return SANITY_ADD_HARE(index, ltable->hare);
 }
@@ -916,10 +929,11 @@ table_get_info(LookupTable *ltable, TableIndex index)
     index = SANITY_REMOVE_HARE(index);
     SANITY_CHECK_INDEX(ltable, index);
 
-    lock_enter(ltable->lock); {
+   //lock_enter(ltable->lock); {
+        //verbose_message("lock_enter table_get_info ltable %s thread %lu\n", ltable->name, (unsigned long)pthread_self());
         HPROF_ASSERT(!is_freed_entry(ltable, index));
         info = get_info(ltable,index);
-    } lock_exit(ltable->lock);
+    //} lock_exit(ltable->lock);
 
     return info;
 }
@@ -935,20 +949,22 @@ table_get_key(LookupTable *ltable, TableIndex index, void **pkey_ptr, int *pkey_
     index = SANITY_REMOVE_HARE(index);
     SANITY_CHECK_INDEX(ltable, index);
 
-    lock_enter(ltable->lock); {
+    //lock_enter(ltable->lock); {
+        //verbose_message("lock_enter table_get_key ltable %s thread %lu\n", ltable->name, (unsigned long)pthread_self());
         HPROF_ASSERT(!is_freed_entry(ltable, index));
         get_key(ltable, index, pkey_ptr, pkey_len);
-    } lock_exit(ltable->lock);
+    //} lock_exit(ltable->lock);
 }
 
 void
 table_lock_enter(LookupTable *ltable)
 {
-    lock_enter(ltable->lock);
+   //lock_enter(ltable->lock);
+    //verbose_message("lock_enter table_lock_enter ltable %s thread %lu\n", ltable->name, (unsigned long)pthread_self());
 }
 
 void
 table_lock_exit(LookupTable *ltable)
 {
-    lock_exit(ltable->lock);
+    //lock_exit(ltable->lock);
 }

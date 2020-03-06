@@ -98,5 +98,6 @@ void       error_do_pause(void);
 void       error_setup(void);
 void       debug_message(const char * format, ...);
 void       verbose_message(const char * format, ...);
+void       print_timestamp(const char * function_name, int begin);
 
 #endif

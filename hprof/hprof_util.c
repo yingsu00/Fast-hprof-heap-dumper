@@ -71,18 +71,45 @@ getEnv(void)
 
     res = JVM_FUNC_PTR(gdata->jvm,GetEnv)
                      (gdata->jvm, (void **)&env, JNI_VERSION_1_2);
-    if (res != JNI_OK) {
-        char buf[256];
 
+    char buf[256];
+    if (res == JNI_EDETACHED) {
+      // (void)md_snprintf(buf, sizeof(buf),
+      //         "yingsu: Unable to access JNI Version 1.2 (0x%x),"
+      //         " is your JDK a 5.0 or newer version?"
+      //         " JNIEnv's GetEnv() returned %d",
+      //        JNI_VERSION_1_2, res);
+      // buf[sizeof(buf)-1] = 0;
+      // HPROF_ERROR(JNI_FALSE, buf);
+      // error_exit_process(1);
+      jint resAttach = JVM_FUNC_PTR(gdata->jvm,AttachCurrentThread)
+                       (gdata->jvm, (void **)&env, NULL);
+
+      if (resAttach != JNI_OK) {
         (void)md_snprintf(buf, sizeof(buf),
-                "Unable to access JNI Version 1.2 (0x%x),"
-                " is your JDK a 5.0 or newer version?"
-                " JNIEnv's GetEnv() returned %d",
-               JNI_VERSION_1_2, res);
-        buf[sizeof(buf)-1] = 0;
+                "yingsu: Uable to attach current thread to the VM");
+        buf[40] = 0;
         HPROF_ERROR(JNI_FALSE, buf);
         error_exit_process(1); /* Kill entire process, no core dump */
+      }
     }
+    else if (res == JNI_EVERSION){
+      (void)md_snprintf(buf, sizeof(buf),
+              "yingsu: Unable to access JNI Version 1.2 (0x%x),"
+              " is your JDK a 5.0 or newer version?"
+              " JNIEnv's GetEnv() returned %d",
+             JNI_VERSION_1_2, res);
+      buf[sizeof(buf)-1] = 0;
+      HPROF_ERROR(JNI_FALSE, buf);
+      error_exit_process(1); /* Kill entire process, no core dump */
+    }
+    else {
+      (void)md_snprintf(buf, sizeof(buf),
+              "yingsu: Successfully acquired JNIEnv");
+      buf[sizeof(buf)-1] = 0;
+      HPROF_ERROR(JNI_FALSE, buf);
+    }
+
     return env;
 }
 
@@ -489,6 +516,7 @@ findClass(JNIEnv *env, const char *name)
     HPROF_ASSERT(env!=NULL);
     HPROF_ASSERT(name!=NULL);
     LOG2("FindClass", name);
+    verbose_message("FindClass %s \n", name);
     CHECK_EXCEPTIONS(env) {
         clazz = JNI_FUNC_PTR(env,FindClass)(env, name);
     } END_CHECK_EXCEPTIONS;
@@ -1720,6 +1748,12 @@ getJvmti(void)
                                         >> JVMTI_VERSION_SHIFT_MINOR;
     jvmtiCompileTimeMicroVersion  = ( JVMTI_VERSION & JVMTI_VERSION_MASK_MICRO )
                                         >> JVMTI_VERSION_SHIFT_MICRO;
+
+    gdata->jvmtiCompileTimeMajorVersion = jvmtiCompileTimeMajorVersion;
+    gdata->jvmtiCompileTimeMinorVersion = jvmtiCompileTimeMinorVersion;
+    gdata->jvmtiCompileTimeMicroVersion = jvmtiCompileTimeMicroVersion;
+
+    //verbose_message("JVMTI_VERSION %s, jvmtiMajorVersion() %s, jvmtiMinorVersion() %s\n", JVMTI_VERSION, jvmtiMajorVersion(), jvmtiMinorVersion());
     if ( !compatible_versions(jvmtiMajorVersion(), jvmtiMinorVersion(),
                 jvmtiCompileTimeMajorVersion, jvmtiCompileTimeMinorVersion) ) {
         char buf[256];

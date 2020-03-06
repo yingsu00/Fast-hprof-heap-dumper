@@ -1,0 +1,2 @@
+make clean OSNAME=linux
+make JDK=/usr/java/jdk-10.0.1/ OSNAME=linux OPT=false

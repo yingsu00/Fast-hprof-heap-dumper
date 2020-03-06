@@ -1,0 +1,1 @@
+java -agentpath:./libhprof.so=heap=dump,format=z,debug=y -classpath . HeapDumpTest2

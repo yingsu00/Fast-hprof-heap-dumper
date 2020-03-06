@@ -76,15 +76,37 @@
  *          however see:
  *           http://java.sun.com/j2se/1.4.2/docs/guide/jvmpi/jvmpi.html#hprof
  */
-
+#include <sys/types.h>
 #include "hprof.h"
 
 typedef TableIndex HprofId;
 
 #include "hprof_ioname.h"
 #include "hprof_b_spec.h"
+#include "zstd.h"
 
 static int type_size[ /*HprofType*/ ] =  HPROF_TYPE_SIZES;
+static char zeros_1KB[1024] ;  // used for heap_zero()
+
+// yings: temp add
+typedef struct MethodInfo {
+    StringIndex  name_index;    /* Method name, index into string table */
+    StringIndex  sig_index;     /* Method signature, index into string table */
+    jmethodID    method_id;     /* Method ID, possibly NULL at first */
+} MethodInfo;
+typedef struct ClassInfo {
+    jclass         classref;            /* Global ref to jclass */
+    MethodInfo    *method;              /* Array of method data */
+    int            method_count;        /* Count of methods */
+    ObjectIndex    object_index;        /* Optional object index for jclass */
+    SerialNumber   serial_num;          /* Unique to the actual class load */
+    ClassStatus    status;              /* Current class status (bit mask) */
+    ClassIndex     super;               /* Super class in this table */
+    StringIndex    name;                /* Name of class */
+    jint           inst_size;           /* #bytes needed for instance fields */
+    jint           field_count;         /* Number of all fields */
+    FieldInfo     *field;               /* Pointer to all FieldInfo's */
+} ClassInfo;
 
 static void dump_heap_segment_and_reset(jlong segment_size);
 
@@ -96,7 +118,8 @@ not_implemented(void)
 static IoNameIndex
 get_name_index(char *name)
 {
-    if (name != NULL && gdata->output_format == 'b') {
+    //if (name != NULL && gdata->output_format == 'b') {
+    if (name != NULL && gdata->output_format != 'a') {
         return ioname_find_or_create(name, NULL);
     }
     return 0;
@@ -276,6 +299,28 @@ system_error(const char *system_call, int rc, int errnum)
 }
 
 static void
+compress_zstd(void *buf, int len)
+{
+    HPROF_ASSERT(len <= gdata->compress_buffer_size);
+    HPROF_ASSERT(gdata->compress_level > 0 && gdata->compress_level <= ZSTD_maxCLevel());
+
+    gdata->compress_buffer_index = 0;
+
+    if (len > gdata->compress_buffer_size) {
+      resize_compressbuf(len);
+    }
+
+    size_t compressedBytes = ZSTD_compress(gdata->compress_buffer, gdata->compress_buffer_size, buf, len, gdata->compress_level);
+    if (ZSTD_isError(compressedBytes)) {
+      HPROF_ERROR(JNI_TRUE, ZSTD_getErrorName(compressedBytes));
+    }
+
+    // The compress buffer should never overflow
+    HPROF_ASSERT(compressedBytes <= gdata->compress_buffer_size);
+    gdata->compress_buffer_index += compressedBytes;
+}
+
+static void
 system_write(int fd, void *buf, int len, jboolean socket)
 {
     int res;
@@ -295,11 +340,23 @@ system_write(int fd, void *buf, int len, jboolean socket)
 }
 
 static void
+system_write_compress(int fd, void *buf, int len, jboolean socket)
+{
+    // Add compression
+    if (gdata->output_format == 'z') {
+      compress_zstd(buf, len);
+      buf = gdata->compress_buffer;
+      len = gdata->compress_buffer_index;
+    }
+    system_write(fd, buf, len, socket);
+}
+
+static void
 write_flush(void)
 {
     HPROF_ASSERT(gdata->fd >= 0);
     if (gdata->write_buffer_index) {
-        system_write(gdata->fd, gdata->write_buffer, gdata->write_buffer_index,
+        system_write_compress(gdata->fd, gdata->write_buffer, gdata->write_buffer_index,
                                 gdata->socket);
         gdata->write_buffer_index = 0;
     }
@@ -324,7 +381,7 @@ write_raw(void *buf, int len)
     if (gdata->write_buffer_index + len > gdata->write_buffer_size) {
         write_flush();
         if (len > gdata->write_buffer_size) {
-            system_write(gdata->fd, buf, len, gdata->socket);
+            system_write_compress(gdata->fd, buf, len, gdata->socket);
             return;
         }
     }
@@ -391,7 +448,8 @@ write_name_first(char *name)
     if ( name == NULL ) {
         return 0;
     }
-    if (gdata->output_format == 'b') {
+
+    if (gdata->output_format != 'a') {
         IoNameIndex name_index;
         jboolean    new_one;
 
@@ -446,6 +504,7 @@ static void
 heap_raw(void *buf, int len)
 {
     HPROF_ASSERT(gdata->heap_fd >= 0);
+
     if (gdata->heap_buffer_index + len > gdata->heap_buffer_size) {
         heap_flush();
         if (len > gdata->heap_buffer_size) {
@@ -456,6 +515,28 @@ heap_raw(void *buf, int len)
     }
     (void)memcpy(gdata->heap_buffer + gdata->heap_buffer_index, buf, len);
     gdata->heap_buffer_index += len;
+    //printf ("yingsu heap_raw end: buf %lld, len %d, gdata->heap_buffer_index %d, gdata->heap_write_count %d", buf, len, gdata->heap_buffer_index, gdata->heap_write_count);
+}
+
+static void
+heap_zero(int numBytes)
+{
+  HPROF_ASSERT(gdata->heap_fd >= 0);
+  if (gdata->heap_buffer_index + numBytes > gdata->heap_buffer_size) {
+      heap_flush();
+      if (numBytes > gdata->heap_buffer_size) {
+          gdata->heap_write_count += (jlong)numBytes;
+          int write_batches = numBytes / 1024;
+          int i = 0;
+          for (; i < write_batches; i++) {
+            system_write(gdata->heap_fd, zeros_1KB, 1024, JNI_FALSE);
+          }
+          system_write(gdata->heap_fd, zeros_1KB, numBytes - write_batches * 1024, JNI_FALSE);
+          return;
+      }
+  }
+  memset(gdata->heap_buffer + gdata->heap_buffer_index, 0, numBytes);
+  gdata->heap_buffer_index += numBytes;
 }
 
 static void
@@ -589,6 +670,8 @@ heap_elements(HprofType kind, jint num_elements, jint elem_size, void *elements)
         return;
     }
 
+    int truncate_elems = num_elements < gdata->truncate_elems ? num_elements : gdata->truncate_elems;
+
     switch ( kind ) {
         case 0:
         case HPROF_ARRAY_OBJECT:
@@ -602,37 +685,50 @@ heap_elements(HprofType kind, jint num_elements, jint elem_size, void *elements)
         case HPROF_BYTE:
         case HPROF_BOOLEAN:
             HPROF_ASSERT(elem_size==1);
-            for (i = 0; i < num_elements; i++) {
+            for (i = 0; i < truncate_elems; i++) {
                 val   = empty_val;
                 val.b = ((jboolean*)elements)[i];
                 heap_element(kind, elem_size, val);
+            }
+            if (num_elements > truncate_elems) {
+              heap_zero((num_elements - truncate_elems) * elem_size);
             }
             break;
         case HPROF_CHAR:
         case HPROF_SHORT:
             HPROF_ASSERT(elem_size==2);
-            for (i = 0; i < num_elements; i++) {
+            for (i = 0; i < truncate_elems; i++) {
                 val   = empty_val;
                 val.s = ((jshort*)elements)[i];
                 heap_element(kind, elem_size, val);
+            }
+            if (num_elements > truncate_elems) {
+              heap_zero((num_elements - truncate_elems) * elem_size);
             }
             break;
         case HPROF_FLOAT:
         case HPROF_INT:
             HPROF_ASSERT(elem_size==4);
-            for (i = 0; i < num_elements; i++) {
+
+            for (i = 0; i < truncate_elems; i++) {
                 val   = empty_val;
                 val.i = ((jint*)elements)[i];
                 heap_element(kind, elem_size, val);
+            }
+            if (num_elements > truncate_elems) {
+              heap_zero((num_elements - truncate_elems) * elem_size);
             }
             break;
         case HPROF_DOUBLE:
         case HPROF_LONG:
             HPROF_ASSERT(elem_size==8);
-            for (i = 0; i < num_elements; i++) {
+            for (i = 0; i < truncate_elems; i++) {
                 val   = empty_val;
                 val.j = ((jlong*)elements)[i];
                 heap_element(kind, elem_size, val);
+            }
+            if (num_elements > truncate_elems) {
+              heap_zero((num_elements - truncate_elems) * elem_size);
             }
             break;
     }
@@ -659,6 +755,13 @@ io_setup(void)
     gdata->heap_buffer_size = FILE_IO_BUFFER_SIZE;
     gdata->heap_buffer = HPROF_MALLOC(gdata->heap_buffer_size);
     gdata->heap_buffer_index = 0;
+
+    // The largest input buffer for compression should be FILE_IO_BUFFER_SIZE * 2 for dump_heap_segment_and_reset()
+    gdata->compress_buffer_size = ZSTD_COMPRESSBOUND(FILE_IO_BUFFER_SIZE * 2);
+    gdata->compress_buffer = HPROF_MALLOC(gdata->compress_buffer_size);
+    gdata->compress_buffer_index = 0;
+    gdata->compress_level = DEFAULT_COMPRESSION_LEVEL;
+    gdata->truncate_elems = DEFAULT_TRUNCATE_ELEMS;
 
     if ( gdata->logflags & LOG_CHECK_BINARY ) {
         gdata->check_buffer_size = FILE_IO_BUFFER_SIZE;
@@ -688,6 +791,15 @@ io_cleanup(void)
     gdata->heap_buffer = NULL;
     gdata->heap_buffer_index = 0;
 
+    if ( gdata->compress_buffer != NULL ) {
+        HPROF_FREE(gdata->compress_buffer);
+    }
+    gdata->compress_buffer = NULL;
+    gdata->compress_buffer_size = 0;
+    gdata->compress_buffer_index = 0;
+    gdata->compress_level = DEFAULT_COMPRESSION_LEVEL;
+    gdata->truncate_elems = DEFAULT_TRUNCATE_ELEMS;
+
     if ( gdata->logflags & LOG_CHECK_BINARY ) {
         if ( gdata->check_buffer != NULL ) {
             HPROF_FREE(gdata->check_buffer);
@@ -704,7 +816,7 @@ void
 io_write_file_header(void)
 {
     HPROF_ASSERT(gdata->header!=NULL);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         jint settings;
         jlong t;
 
@@ -781,7 +893,7 @@ io_write_class_load(SerialNumber class_serial_num, ObjectIndex index,
 {
     CHECK_CLASS_SERIAL_NO(class_serial_num);
     CHECK_TRACE_SERIAL_NO(trace_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         IoNameIndex name_index;
         char *class_name;
 
@@ -799,8 +911,9 @@ io_write_class_load(SerialNumber class_serial_num, ObjectIndex index,
 void
 io_write_class_unload(SerialNumber class_serial_num, ObjectIndex index)
 {
-    CHECK_CLASS_SERIAL_NO(class_serial_num);
-    if (gdata->output_format == 'b') {
+    //CHECK_CLASS_SERIAL_NO(class_serial_num);
+
+    if (gdata->output_format != 'a') {
         write_header(HPROF_UNLOAD_CLASS, 4);
         write_u4(class_serial_num);
     }
@@ -812,7 +925,8 @@ io_write_sites_header(const char * comment_str, jint flags, double cutoff,
                     jlong total_alloced_bytes, jlong total_alloced_instances,
                     jint count)
 {
-    if ( gdata->output_format == 'b') {
+  // if ( gdata->output_format == 'b') {
+    if ( gdata->output_format != 'a') {
         write_header(HPROF_ALLOC_SITES, 2 + (8 * 4) + (count * (4 * 6 + 1)));
         write_u2((unsigned short)flags);
         write_u4(*(int *)(&cutoff));
@@ -842,7 +956,7 @@ io_write_sites_elem(jint index, double ratio, double accum_percent,
 {
     CHECK_CLASS_SERIAL_NO(class_serial_num);
     CHECK_TRACE_SERIAL_NO(trace_serial_num);
-    if ( gdata->output_format == 'b') {
+    if ( gdata->output_format != 'a') {
         HprofType kind;
         jint size;
 
@@ -875,7 +989,7 @@ io_write_sites_elem(jint index, double ratio, double accum_percent,
 void
 io_write_sites_footer(void)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         not_implemented();
     } else {
         write_printf("SITES END\n");
@@ -890,7 +1004,7 @@ io_write_thread_start(SerialNumber thread_serial_num,
 {
     CHECK_THREAD_SERIAL_NO(thread_serial_num);
     CHECK_TRACE_SERIAL_NO(trace_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         IoNameIndex tname_index;
         IoNameIndex gname_index;
         IoNameIndex pname_index;
@@ -920,7 +1034,7 @@ void
 io_write_thread_end(SerialNumber thread_serial_num)
 {
     CHECK_THREAD_SERIAL_NO(thread_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         write_header(HPROF_END_THREAD, 4);
         write_u4(thread_serial_num);
 
@@ -936,7 +1050,7 @@ io_write_frame(FrameIndex index, SerialNumber frame_serial_num,
                SerialNumber class_serial_num, jint lineno)
 {
     CHECK_CLASS_SERIAL_NO(class_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         IoNameIndex mname_index;
         IoNameIndex msig_index;
         IoNameIndex sname_index;
@@ -960,7 +1074,7 @@ io_write_trace_header(SerialNumber trace_serial_num,
                 SerialNumber thread_serial_num, jint n_frames, char *phase_str)
 {
     CHECK_TRACE_SERIAL_NO(trace_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         write_header(HPROF_TRACE, ((jint)sizeof(HprofId) * n_frames) + (4 * 3));
         write_u4(trace_serial_num);
         write_u4(thread_serial_num);
@@ -985,7 +1099,7 @@ io_write_trace_elem(SerialNumber trace_serial_num, FrameIndex frame_index,
                     SerialNumber frame_serial_num,
                     char *csig, char *mname, char *sname, jint lineno)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         write_index_id(frame_index);
     } else {
         char *class_name;
@@ -1025,8 +1139,7 @@ io_write_trace_footer(SerialNumber trace_serial_num,
 void
 io_write_cpu_samples_header(jlong total_cost, jint n_items)
 {
-
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         write_header(HPROF_CPU_SAMPLES, (n_items * (4 * 2)) + (4 * 2));
         write_u4((jint)total_cost);
         write_u4(n_items);
@@ -1054,7 +1167,7 @@ io_write_cpu_samples_elem(jint index, double percent, double accum,
                 jint n_frames, char *csig, char *mname)
 {
     CHECK_TRACE_SERIAL_NO(trace_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         write_u4((jint)cost);
         write_u4(trace_serial_num);
     } else {
@@ -1076,7 +1189,7 @@ io_write_cpu_samples_elem(jint index, double percent, double accum,
 void
 io_write_cpu_samples_footer(void)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         not_implemented();
     } else {
         char *record_name;
@@ -1094,7 +1207,7 @@ void
 io_write_heap_summary(jlong total_live_bytes, jlong total_live_instances,
                 jlong total_alloced_bytes, jlong total_alloced_instances)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         write_header(HPROF_HEAP_SUMMARY, 4 * 6);
         write_u4((jint)total_live_bytes);
         write_u4((jint)total_live_instances);
@@ -1149,7 +1262,7 @@ io_write_oldprof_footer(void)
 void
 io_write_monitor_header(jlong total_time)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         not_implemented();
     } else {
         time_t t = time(0);
@@ -1168,7 +1281,7 @@ io_write_monitor_elem(jint index, double percent, double accum,
             jint num_hits, SerialNumber trace_serial_num, char *sig)
 {
     CHECK_TRACE_SERIAL_NO(trace_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         not_implemented();
     } else {
         char *class_name;
@@ -1184,7 +1297,7 @@ io_write_monitor_elem(jint index, double percent, double accum,
 void
 io_write_monitor_footer(void)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         not_implemented();
     } else {
         write_printf("MONITOR TIME END\n");
@@ -1194,7 +1307,7 @@ io_write_monitor_footer(void)
 void
 io_write_monitor_sleep(jlong timeout, SerialNumber thread_serial_num)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         not_implemented();
     } else {
         if ( thread_serial_num == 0 ) {
@@ -1212,7 +1325,7 @@ void
 io_write_monitor_wait(char *sig, jlong timeout,
                 SerialNumber thread_serial_num)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         not_implemented();
     } else {
         if ( thread_serial_num == 0 ) {
@@ -1230,7 +1343,7 @@ void
 io_write_monitor_waited(char *sig, jlong time_waited,
                 SerialNumber thread_serial_num)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         not_implemented();
     } else {
         if ( thread_serial_num == 0 ) {
@@ -1247,7 +1360,7 @@ io_write_monitor_waited(char *sig, jlong time_waited,
 void
 io_write_monitor_exit(char *sig, SerialNumber thread_serial_num)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         not_implemented();
     } else {
         if ( thread_serial_num == 0 ) {
@@ -1263,7 +1376,7 @@ io_write_monitor_exit(char *sig, SerialNumber thread_serial_num)
 void
 io_write_monitor_dump_header(void)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         not_implemented();
     } else {
         write_printf("MONITOR DUMP BEGIN\n");
@@ -1277,7 +1390,7 @@ io_write_monitor_dump_thread_state(SerialNumber thread_serial_num,
 {
     CHECK_THREAD_SERIAL_NO(thread_serial_num);
     CHECK_TRACE_SERIAL_NO(trace_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         not_implemented();
     } else {
         char tstate[20];
@@ -1323,7 +1436,7 @@ io_write_monitor_dump_state(char *sig, SerialNumber thread_serial_num,
                     SerialNumber *waiters, jint waiter_count,
                     SerialNumber *notify_waiters, jint notify_waiter_count)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format == 'b' || gdata->output_format == 'z') {
         not_implemented();
     } else {
         int i;
@@ -1354,7 +1467,7 @@ io_write_monitor_dump_state(char *sig, SerialNumber thread_serial_num,
 void
 io_write_monitor_dump_footer(void)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         not_implemented();
     } else {
         write_printf("MONITOR DUMP END\n");
@@ -1367,7 +1480,7 @@ io_write_monitor_dump_footer(void)
 void
 io_heap_header(jlong total_live_instances, jlong total_live_bytes)
 {
-    if (gdata->output_format != 'b') {
+    if (gdata->output_format != 'b' && gdata->output_format != 'z') {
         time_t t;
 
         t = time(0);
@@ -1383,7 +1496,7 @@ io_heap_root_thread_object(ObjectIndex thread_obj_id,
 {
     CHECK_THREAD_SERIAL_NO(thread_serial_num);
     CHECK_TRACE_SERIAL_NO(trace_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
          heap_tag(HPROF_GC_ROOT_THREAD_OBJ);
          heap_id(thread_obj_id);
          heap_u4(thread_serial_num);
@@ -1397,7 +1510,8 @@ io_heap_root_thread_object(ObjectIndex thread_obj_id,
 void
 io_heap_root_unknown(ObjectIndex obj_id)
 {
-    if (gdata->output_format == 'b') {
+
+    if (gdata->output_format != 'a') {
         heap_tag(HPROF_GC_ROOT_UNKNOWN);
         heap_id(obj_id);
     } else {
@@ -1410,7 +1524,7 @@ io_heap_root_jni_global(ObjectIndex obj_id, SerialNumber gref_serial_num,
                          SerialNumber trace_serial_num)
 {
     CHECK_TRACE_SERIAL_NO(trace_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         heap_tag(HPROF_GC_ROOT_JNI_GLOBAL);
         heap_id(obj_id);
         heap_id(gref_serial_num);
@@ -1425,8 +1539,8 @@ void
 io_heap_root_jni_local(ObjectIndex obj_id, SerialNumber thread_serial_num,
         jint frame_depth)
 {
-    CHECK_THREAD_SERIAL_NO(thread_serial_num);
-    if (gdata->output_format == 'b') {
+    //CHECK_THREAD_SERIAL_NO(thread_serial_num);
+    if (gdata->output_format != 'a') {
         heap_tag(HPROF_GC_ROOT_JNI_LOCAL);
         heap_id(obj_id);
         heap_u4(thread_serial_num);
@@ -1441,7 +1555,7 @@ io_heap_root_jni_local(ObjectIndex obj_id, SerialNumber thread_serial_num,
 void
 io_heap_root_system_class(ObjectIndex obj_id, char *sig, SerialNumber class_serial_num)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         heap_tag(HPROF_GC_ROOT_STICKY_CLASS);
         heap_id(obj_id);
     } else {
@@ -1457,7 +1571,7 @@ io_heap_root_system_class(ObjectIndex obj_id, char *sig, SerialNumber class_seri
 void
 io_heap_root_monitor(ObjectIndex obj_id)
 {
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         heap_tag(HPROF_GC_ROOT_MONITOR_USED);
         heap_id(obj_id);
     } else {
@@ -1468,8 +1582,9 @@ io_heap_root_monitor(ObjectIndex obj_id)
 void
 io_heap_root_thread(ObjectIndex obj_id, SerialNumber thread_serial_num)
 {
+
     CHECK_THREAD_SERIAL_NO(thread_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         heap_tag(HPROF_GC_ROOT_THREAD_BLOCK);
         heap_id(obj_id);
         heap_u4(thread_serial_num);
@@ -1484,7 +1599,7 @@ io_heap_root_java_frame(ObjectIndex obj_id, SerialNumber thread_serial_num,
         jint frame_depth)
 {
     CHECK_THREAD_SERIAL_NO(thread_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         heap_tag(HPROF_GC_ROOT_JAVA_FRAME);
         heap_id(obj_id);
         heap_u4(thread_serial_num);
@@ -1500,7 +1615,7 @@ void
 io_heap_root_native_stack(ObjectIndex obj_id, SerialNumber thread_serial_num)
 {
     CHECK_THREAD_SERIAL_NO(thread_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         heap_tag(HPROF_GC_ROOT_NATIVE_STACK);
         heap_id(obj_id);
         heap_u4(thread_serial_num);
@@ -1538,7 +1653,7 @@ io_heap_class_dump(ClassIndex cnum, char *sig, ObjectIndex class_id,
                 jint n_fields, FieldInfo *fields, jvalue *fvalues)
 {
     CHECK_TRACE_SERIAL_NO(trace_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         int  i;
         jint n_static_fields;
         jint n_inst_fields;
@@ -1577,11 +1692,29 @@ io_heap_class_dump(ClassIndex cnum, char *sig, ObjectIndex class_id,
          */
         if ( size >= 0 ) {
             saved_inst_size = class_get_inst_size(cnum);
+
+            // yingsu : print debug info
+            // verbose_message("\nio_heap_class_dump");
+            // ClassInfo *info;
+            // info = (ClassInfo*)table_get_info(gdata->class_table, cnum);
+            // char    *class_name = string_get(info->name);
+            // verbose_message("%d %s saved_inst_size %d, inst_size %d, info->inst_size %d \n", cnum, class_name, saved_inst_size, inst_size, info->inst_size);
+
+
             if ( saved_inst_size == -1 ) {
                 class_set_inst_size(cnum, inst_size);
-            } else if ( saved_inst_size != inst_size ) {
-                HPROF_ERROR(JNI_TRUE, "Mis-match on instance size in class dump");
+            } else {
+                if ( saved_inst_size != inst_size ) {
+                  // yingsu : print debug info
+                  //ClassInfo *info;
+                  //info = (ClassInfo*)table_get_info(gdata->class_table, cnum);
+                  //char    *class_name = string_get(info->name);
+                  //verbose_message("%d %s saved_inst_size %d, inst_size %d, info->instance_size %d \n", cnum, class_name, saved_inst_size, inst_size, info->inst_size);
+
+                //HPROF_ERROR(JNI_TRUE, "Mis-match on instance size in class dump");
+                HPROF_ERROR(JNI_FALSE, "Mis-match on instance size in class dump");
             }
+          }
         }
 
         heap_tag(HPROF_GC_CLASS_DUMP);
@@ -1733,7 +1866,7 @@ io_heap_instance_dump(ClassIndex cnum, ObjectIndex obj_id,
                 FieldInfo *fields, jvalue *fvalues, jint n_fields)
 {
     CHECK_TRACE_SERIAL_NO(trace_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         jint inst_size;
         jint saved_inst_size;
         int  i;
@@ -1751,10 +1884,24 @@ io_heap_instance_dump(ClassIndex cnum, ObjectIndex obj_id,
          *   class.
          */
         saved_inst_size = class_get_inst_size(cnum);
+
+
+        // ClassInfo *info;
+        // info = (ClassInfo*)table_get_info(gdata->class_table, cnum);
+        // char    *class_name = string_get(info->name);
+        // verbose_message("%d %s saved_inst_size %d, inst_size %d, info->inst_size %d \n", cnum, class_name, saved_inst_size, inst_size, info->inst_size);
+
         if ( saved_inst_size == -1 ) {
             class_set_inst_size(cnum, inst_size);
         } else if ( saved_inst_size != inst_size ) {
-            HPROF_ERROR(JNI_TRUE, "Mis-match on instance size in instance dump");
+          // yingsu : print debug info
+          //ClassInfo *info;
+          //info = (ClassInfo*)table_get_info(gdata->class_table, cnum);
+          //char    *class_name = string_get(info->name);
+          //verbose_message("%d %s saved_inst_size %d, inst_size %d, info->instance_size %d \n", cnum, class_name, saved_inst_size, inst_size, info->inst_size);
+
+            HPROF_ERROR(JNI_FALSE, "Mis-match on instance size in instance dump");
+            //HPROF_ERROR(JNI_TRUE, "Mis-match on instance size in instance dump");
         }
 
         heap_tag(HPROF_GC_INSTANCE_DUMP);
@@ -1805,7 +1952,7 @@ io_heap_object_array(ObjectIndex obj_id, SerialNumber trace_serial_num,
                 ObjectIndex class_id)
 {
     CHECK_TRACE_SERIAL_NO(trace_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
 
         heap_tag(HPROF_GC_OBJ_ARRAY_DUMP);
         heap_id(obj_id);
@@ -1839,7 +1986,7 @@ io_heap_prim_array(ObjectIndex obj_id, SerialNumber trace_serial_num,
               jint size, jint num_elements, char *sig, void *elements)
 {
     CHECK_TRACE_SERIAL_NO(trace_serial_num);
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format != 'a') {
         HprofType kind;
         jint  esize;
 
@@ -1921,7 +2068,7 @@ dump_heap_segment_and_reset(jlong segment_size)
     HPROF_ASSERT(last_chunk_len>=0);
 
     /* Re-open in proper way, binary vs. ascii is important */
-    if (gdata->output_format == 'b') {
+    if (gdata->output_format == 'b' || gdata->output_format == 'z') {
         int   tag;
 
         if ( gdata->segmented == JNI_TRUE ) { /* 1.0.2 */
@@ -1936,7 +2083,7 @@ dump_heap_segment_and_reset(jlong segment_size)
 
         fd = md_open_binary(gdata->heapfilename);
     } else {
-        fd = md_open(gdata->heapfilename);
+        fd = md_open(gdata->heapfilename);  //readonly
     }
 
     /* Move file bytes into hprof dump file */
@@ -1970,7 +2117,7 @@ io_heap_footer(void)
     dump_heap_segment_and_reset(gdata->heap_write_count);
 
     /* Write out the last tag */
-    if (gdata->output_format != 'b') {
+    if (gdata->output_format != 'b' && gdata->output_format != 'z') {
         write_printf("HEAP DUMP END\n");
     } else {
         if ( gdata->segmented == JNI_TRUE ) { /* 1.0.2 */

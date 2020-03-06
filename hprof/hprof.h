@@ -98,6 +98,9 @@ typedef unsigned SerialNumber;
 /* File I/O buffer size to be used with any file i/o operation */
 
 #define FILE_IO_BUFFER_SIZE     (1024*64)
+#define DEFAULT_COMPRESSION_LEVEL     (1)
+#define DEFAULT_TRUNCATE_ELEMS     (128)
+#define HEAP_SEGMENT_SIZE     (1000000000)
 
 /* Machine dependent functions. */
 
@@ -209,6 +212,7 @@ typedef struct {
     JavaVM              *jvm;   /* JavaVM* for this session */
 #ifndef SKIP_NPT
     NptEnv              *npt;   /* NptEnv* for this session, see npt.h */
+    // char                npt_lib[JVM_MAXPATHLEN];
 #endif
     jint                cachedJvmtiVersion; /* JVMTI version number */
 
@@ -216,6 +220,8 @@ typedef struct {
     jboolean            segmented;  /* JNI_TRUE if 1.0.2 */
     jlong               maxHeapSegment;
     jlong               maxMemory;
+
+    char                errmsg[256];
 
     /* Option settings */
     char *              options;             /* option string copy */
@@ -336,6 +342,22 @@ typedef struct {
     char *              check_buffer;
     int                 check_buffer_index;
     int                 check_buffer_size;
+
+    char *              heap_segment_buffer;
+    int                 heap_segment_buffer_index;
+    int                 heap_segment_buffer_size;
+    char *              compress_buffer;
+    int                 compress_buffer_index;
+    int                 compress_buffer_size;
+    int                 compress_level;  // 0 means no compression
+    int                 truncate_elems;  // 0 means do not truncate primitive arrays
+
+    unsigned               heap_raw_threadid;
+    jrawMonitorID       heap_raw_threadid_lock;
+
+    jint                jvmtiCompileTimeMajorVersion;
+    jint                jvmtiCompileTimeMinorVersion;
+    jint                jvmtiCompileTimeMicroVersion;
 
     /* Serial number counters for tables (see hprof_table.c), classes,
      *     tls (thread local storage), and traces.

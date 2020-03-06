@@ -230,7 +230,8 @@ search_item(TableIndex index, void *key_ptr, int key_len,
     SearchData  *data;
     jobject      lref;
 
-    HPROF_ASSERT(info_ptr!=NULL);
+    // yingsu:
+    //HPROF_ASSERT(info_ptr!=NULL);
     HPROF_ASSERT(arg!=NULL);
     info        = (TlsInfo*)info_ptr;
     data        = (SearchData*)arg;

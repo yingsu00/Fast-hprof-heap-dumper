@@ -213,3 +213,12 @@ verbose_message(const char * format, ...)
         va_end(ap);
     }
 }
+
+void print_timestamp(const char * function_name, int begin)
+{
+  if (gdata->debug) {
+    time_t now = time(NULL);
+    struct tm *ptm = localtime(&now);
+    verbose_message("hprof %s %s : %04dT%02d-%02d %02d:%02d:%02d thread %lu\n", function_name, begin != 0 ? "begin": "end", ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec, (unsigned long)pthread_self());
+  }
+}

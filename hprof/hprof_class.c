@@ -575,6 +575,11 @@ class_set_inst_size(ClassIndex index, jint inst_size)
     ClassInfo *info;
 
     info = get_info(index);
+
+// yingsu: add debug infoio_heap_instance_dump
+    // char    *class_name = string_get(info->name);
+    // verbose_message("class_set_inst_size %s %d \n", class_name, inst_size);
+
     info->inst_size = inst_size;
 }
 

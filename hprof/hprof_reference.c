@@ -603,7 +603,8 @@ dump_instance(JNIEnv *env, ObjectIndex object_index, RefIndex list)
                     case JVMTI_HEAP_REFERENCE_STATIC_FIELD:
                     case JVMTI_HEAP_REFERENCE_CONSTANT_POOL:
                         /* Should never be seen on an instance dump */
-                        HPROF_ASSERT(0);
+                        // yingsu: we do see JVMTI_HEAP_REFERENCE_CONSTANT_POOL here
+                        //HPROF_ASSERT(0);
                         break;
                     case JVMTI_HEAP_REFERENCE_FIELD:
                         if ( skip_fields == JNI_TRUE ) {
